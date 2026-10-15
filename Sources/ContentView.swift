@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var store: RecordingsStore
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var recorder = Recorder()
     @State private var tab = 0
 
@@ -25,6 +26,11 @@ struct ContentView: View {
         }
         .onAppear {
             recorder.onFinish = { rec in store.add(rec) }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // Запись идёт в фоне и не прерывается. При возврате в приложение
+            // достаточно поправить таймер и, если микрофон забирали, вернуть запись.
+            if phase == .active { recorder.appBecameActive() }
         }
     }
 }

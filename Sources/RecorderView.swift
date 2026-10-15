@@ -6,10 +6,10 @@ struct RecorderView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 26) {
+            VStack(spacing: 22) {
                 Spacer(minLength: 8)
 
-                Text(recorder.isRecording ? "Идёт запись" : "Готово к записи")
+                Text(statusTitle)
                     .font(.title2.bold())
                     .foregroundStyle(recorder.isRecording ? .red : .secondary)
 
@@ -21,13 +21,20 @@ struct RecorderView: View {
 
                 recordButton
 
-                Text(recorder.isRecording
-                     ? "Говорите. Для записи обоих голосов включите громкую связь."
-                     : "Включите громкую связь на телефоне и нажмите «Начать запись», чтобы записать оба голоса.")
+                Text(statusHint)
                     .font(.footnote)
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal)
+
+                if recorder.isRecording {
+                    Label("Запись идёт и в фоне — можно свернуть приложение и позвонить",
+                          systemImage: "arrow.down.circle")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                }
 
                 if recorder.autoRecord {
                     Label("Автозапись включена: запись начнётся при громкой речи",
@@ -52,6 +59,21 @@ struct RecorderView: View {
                 }
             }
         }
+    }
+
+    private var statusTitle: String {
+        if recorder.interrupted { return "Запись на паузе (идёт звонок)" }
+        return recorder.isRecording ? "Идёт запись" : "Готово к записи"
+    }
+
+    private var statusHint: String {
+        if recorder.interrupted {
+            return "Система забрала микрофон. Запись вернётся автоматически, когда звонок освободит его."
+        }
+        if recorder.isRecording {
+            return "Говорите. Для записи обоих голосов включите громкую связь. Приложение можно свернуть — запись не остановится."
+        }
+        return "Нажмите «Начать запись», сверните приложение и позвоните по громкой связи. Запись пойдёт в фоне."
     }
 
     private var timer: some View {

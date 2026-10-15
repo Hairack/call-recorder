@@ -38,6 +38,10 @@ targets:
         UIUserInterfaceStyle: Dark
         UILaunchScreen: {}
         UIFileSharingEnabled: true
+        # Фоновая запись: без этого iOS останавливает запись, когда
+        # приложение свёрнуто или экран заблокирован.
+        UIBackgroundModes:
+          - audio
         LSSupportsOpeningDocumentsInPlace: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

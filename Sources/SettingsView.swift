@@ -5,8 +5,10 @@ struct SettingsView: View {
     @ObservedObject var recorder: Recorder
     @State private var micStatus = "неизвестно"
     @State private var storage = "-"
+    @State private var bgStatus = "—"
     @State private var autoRecord: Bool = UserDefaults.standard.bool(forKey: "autoRecord")
     @State private var threshold: Double = UserDefaults.standard.object(forKey: "threshold") as? Double ?? 0.25
+    @State private var resume: Bool = UserDefaults.standard.object(forKey: "resume") as? Bool ?? true
 
     var body: some View {
         NavigationStack {
@@ -20,6 +22,21 @@ struct SettingsView: View {
                     Button("Запросить доступ к микрофону") {
                         Task { _ = await Recorder.ensurePermission(); refresh() }
                     }
+                }
+
+                Section("Фоновая запись") {
+                    HStack {
+                        Text("Режим «audio»")
+                        Spacer()
+                        Text(bgStatus).foregroundStyle(.secondary)
+                    }
+                    Toggle("Продолжать запись после звонка", isOn: $resume)
+                        .onChange(of: resume) { _, v in
+                            UserDefaults.standard.set(v, forKey: "resume")
+                            recorder.resumeAfterInterruption = v
+                        }
+                    Text("Приложение продолжает писать, когда свёрнуто или экран заблокирован. Если во время записи поступает звонок, система забирает микрофон на время разговора — запись автоматически вернётся после него.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
 
                 Section("Автозапись") {
@@ -37,7 +54,7 @@ struct SettingsView: View {
                                 recorder.autoLevelThreshold = Float(v)
                             }
                     }
-                    Text("Автозапись полезна, если телефон лежит рядом. Но надёжнее записывать кнопкой — тогда точно захватится весь разговор.")
+                    Text("Автозапись пригодится, если телефон лежит рядом. Она тоже работает в фоне.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
@@ -53,7 +70,7 @@ struct SettingsView: View {
 
                 Section("О приложении") {
                     LabeledContent("Название", value: "Диктофон разговоров")
-                    LabeledContent("Версия", value: "1.0")
+                    LabeledContent("Версия", value: "1.1")
                     LabeledContent("Язык", value: "Русский")
                 }
             }
@@ -61,6 +78,7 @@ struct SettingsView: View {
             .onAppear {
                 recorder.autoRecord = autoRecord
                 recorder.autoLevelThreshold = Float(threshold)
+                recorder.resumeAfterInterruption = resume
                 if autoRecord { recorder.armAutoRecord() }
                 refresh()
             }
@@ -75,6 +93,10 @@ struct SettingsView: View {
         case .undetermined: micStatus = "не запрошен"
         @unknown default: micStatus = "неизвестно"
         }
+
+        let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String] ?? []
+        bgStatus = modes.contains("audio") ? "включён" : "выключен"
+
         let dir = RecordingsStore.audioDirectory
         let files = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey])) ?? []
         let total = files.compactMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize }.reduce(0, +)
