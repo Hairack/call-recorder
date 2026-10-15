@@ -27,6 +27,7 @@ targets:
         PRODUCT_NAME: CallRecorder
         ENABLE_USER_SCRIPT_SANDBOXING: "NO"
         SWIFT_STRICT_CONCURRENCY: minimal
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     info:
       path: Support/Info.plist
       properties:
