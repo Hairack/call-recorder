@@ -5,6 +5,7 @@ options:
     iOS: "17.0"
   developmentLanguage: ru
   createIntermediateGroups: true
+  objectVersion: 56
 
 settings:
   base:
