@@ -1,0 +1,63 @@
+name: Сборка IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Получить код
+        uses: actions/checkout@v4
+
+      - name: Показать версии
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Установить XcodeGen
+        run: brew install xcodegen
+
+      - name: Сгенерировать проект
+        run: xcodegen generate
+
+      - name: Собрать без подписи
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project CallRecorder.xcodeproj \
+            -scheme CallRecorder \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            build | tail -n 40
+
+      - name: Найти приложение
+        id: find
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -n1)
+          if [ -z "$APP" ]; then echo "Приложение не собралось"; exit 1; fi
+          echo "app=$APP" >> $GITHUB_OUTPUT
+          echo "Найдено: $APP"
+
+      - name: Упаковать в IPA
+        run: |
+          set -e
+          rm -rf out && mkdir -p out/Payload
+          cp -R "${{ steps.find.outputs.app }}" out/Payload/
+          cd out && zip -qry CallRecorder.ipa Payload
+          ls -la CallRecorder.ipa
+
+      - name: Выгрузить IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallRecorder-ipa
+          path: out/CallRecorder.ipa
+          if-no-files-found: error
