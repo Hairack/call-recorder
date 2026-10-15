@@ -36,9 +36,9 @@ struct RecorderView: View {
                         .padding(.horizontal)
                 }
 
-                if recorder.partsCount > 1 {
-                    Label("Разговор собирается из \(recorder.partsCount) частей — при остановке они склеятся в одну запись.",
-                          systemImage: "square.stack.3d.up")
+                if recorder.micBusy {
+                    Label("Как только звонок отпустит микрофон, запись продолжится сама — в тот же файл.",
+                          systemImage: "arrow.clockwise.circle")
                         .font(.caption)
                         .foregroundStyle(.orange)
                         .multilineTextAlignment(.center)

@@ -4,16 +4,129 @@ import Combine
 import UIKit
 import CallKit
 
-/// Запись через микрофон. Рассчитана на разговор по громкой связи.
+/// Пишет звук микрофона непрерывно в ОДИН файл.
+///
+/// Раньше запись шла «кусками»: при каждом возврате звука открывался новый
+/// файл, а незавершённый система сбрасывала. Из-за этого звук был рваным, а
+/// вместо одной записи получалось несколько файлов.
+///
+/// Здесь файл открывается один раз на всю запись и больше никогда не
+/// переоткрывается. Аудиодвижок можно останавливать и запускать сколько угодно
+/// раз (звонок, смена маршрута) — новые звуки просто дописываются в тот же файл.
+final class AudioWriter {
+
+    let format: AVAudioFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                              sampleRate: 44_100,
+                                              channels: 1,
+                                              interleaved: false)!
+
+    private let lock = NSLock()
+    private var file: AVAudioFile?
+    private var converter: AVAudioConverter?
+    private var frames: AVAudioFramePosition = 0
+    private var level: Float = 0
+    private var lastWrite: Date?
+
+    /// Сколько кадров реально записано (это и есть длительность по звуку).
+    var framesWritten: AVAudioFramePosition {
+        lock.lock(); defer { lock.unlock() }
+        return frames
+    }
+
+    /// Текущая громкость 0...1 для индикатора.
+    var currentLevel: Float {
+        lock.lock(); defer { lock.unlock() }
+        return level
+    }
+
+    /// Когда последний раз был записан звук.
+    var lastWriteAt: Date? {
+        lock.lock(); defer { lock.unlock() }
+        return lastWrite
+    }
+
+    var recordedSeconds: TimeInterval {
+        Double(framesWritten) / format.sampleRate
+    }
+
+    /// Открывает рабочий файл. Вызывается один раз на всю запись.
+    func open(url: URL) {
+        lock.lock(); defer { lock.unlock() }
+        frames = 0
+        level = 0
+        lastWrite = nil
+        converter = nil
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatLinearPCM),
+            AVSampleRateKey: format.sampleRate,
+            AVNumberOfChannelsKey: Int(format.channelCount),
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+        file = try? AVAudioFile(forWriting: url,
+                                settings: settings,
+                                commonFormat: .pcmFormatFloat32,
+                                interleaved: false)
+    }
+
+    /// Подбирает преобразование под текущий формат микрофона.
+    func configure(inputFormat: AVAudioFormat) {
+        lock.lock(); defer { lock.unlock() }
+        if converter?.inputFormat.isEqual(inputFormat) != true {
+            converter = AVAudioConverter(from: inputFormat, to: format)
+        }
+    }
+
+    /// Принимает звук от микрофона и дописывает его в файл.
+    func write(_ buffer: AVAudioPCMBuffer) {
+        lock.lock(); defer { lock.unlock() }
+        guard let file, let converter else { return }
+
+        if let channels = buffer.floatChannelData, buffer.frameLength > 0 {
+            let n = Int(buffer.frameLength)
+            var sum: Float = 0
+            for i in 0..<n {
+                let v = channels[0][i]
+                sum += v * v
+            }
+            level = min(1, (sum / Float(n)).squareRoot() * 6)
+        }
+
+        let ratio = format.sampleRate / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 2048
+        guard let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else { return }
+
+        var supplied = false
+        var error: NSError?
+        let status = converter.convert(to: out, error: &error) { _, outStatus in
+            if supplied {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            supplied = true
+            outStatus.pointee = .haveData
+            return buffer
+        }
+        guard status != .error, out.frameLength > 0 else { return }
+        guard (try? file.write(from: out)) != nil else { return }
+        frames += AVAudioFramePosition(out.frameLength)
+        lastWrite = Date()
+    }
+
+    func close() {
+        lock.lock(); defer { lock.unlock() }
+        converter = nil
+        file = nil
+    }
+}
+
+/// Запись разговора через микрофон. Рассчитана на громкую связь.
 ///
 /// Запись НЕ останавливается сама: пока пользователь не нажал «Стоп», приложение
 /// держит её включённой и возвращает звук при первой возможности — например,
-/// сразу после окончания телефонного разговора.
-///
-/// Важно: каждый раз, когда звук приходится начинать заново, пишется НОВЫЙ
-/// файл-кусок, а старый закрывается. Переоткрывать один и тот же файл нельзя —
-/// именно из-за этого звук получался рваным. При остановке куски автоматически
-/// склеиваются в одну запись.
+/// сразу после окончания телефонного разговора. Всё пишется в один файл.
 @MainActor
 final class Recorder: NSObject, ObservableObject {
 
@@ -27,34 +140,31 @@ final class Recorder: NSObject, ObservableObject {
     /// освободится. Останавливает запись только пользователь.
     @Published private(set) var micBusy = false
 
-    /// Сколько кусков уже записано. Обычно один.
+    /// Сколько файлов получится. Всегда один — оставлено для экрана записи.
     @Published private(set) var partsCount = 0
 
     /// Автозапись: старт, когда звук дольше порога держится громким.
     @Published var autoRecord = false
     @Published var autoLevelThreshold: Float = 0.25
 
-    /// Настройка из раздела «Настройки». Сейчас запись всегда продолжается,
-    /// поэтому значение только хранится.
+    /// Настройка из раздела «Настройки».
     @Published var resumeAfterInterruption = true
 
-    private var recorder: AVAudioRecorder?
+    private let engine = AVAudioEngine()
+    private let writer = AudioWriter()
+
     private var timer: Timer?
     private var autoTimer: Timer?
-    /// Сторож: пока запись включена, проверяет, что звук пишется, и возвращает
-    /// запись при первой возможности.
     private var watchdog: Timer?
-    /// Тихая «подложка»: не даёт системе усыпить приложение, пока идёт запись
-    /// (в том числе пока микрофон занят звонком).
-    private var keepAlive: AVAudioPlayer?
     private var loudSince: Date?
     private var observers: [NSObjectProtocol] = []
     private var bgTask: UIBackgroundTaskIdentifier = .invalid
-    /// Системный наблюдатель за звонками.
     private let callObserver = CXCallObserver()
 
-    /// Куски одной записи: файл, начало и конец (nil — пишется прямо сейчас).
-    private var parts: [(url: URL, start: Date, end: Date?)] = []
+    private var tapInstalled = false
+    private var installedFormat: AVAudioFormat?
+    private var fileURL: URL?
+    private var startedAt: Date?
 
     var onFinish: ((Recording) -> Void)?
 
@@ -71,7 +181,7 @@ final class Recorder: NSObject, ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 if type == .began, !wasSuspended {
-                    self.markMicBusy()
+                    self.suspendForInterruption()
                 } else {
                     self.tryResumeNow()
                 }
@@ -84,7 +194,7 @@ final class Recorder: NSObject, ObservableObject {
             Task { @MainActor in self?.tryResumeNow() }
         })
 
-        // Звуковая подсистема перезапустилась — кусок закрываем и начинаем новый.
+        // Звуковая подсистема перезапустилась — поднимаем движок заново.
         observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification,
                                             object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.tryResumeNow() }
@@ -128,14 +238,14 @@ final class Recorder: NSObject, ObservableObject {
             guard await Self.ensurePermission() else { return }
             guard !self.isRecording else { return }
             self.isRecording = true
-            self.parts = []
-            self.partsCount = 0
             self.elapsed = 0
             self.peak = 0
             self.micBusy = false
+            self.partsCount = 1
+            self.startedAt = Date()
             self.beginBgTask()
-            self.startKeepAlive()
-            self.openPart()
+            self.openFile()
+            self.startEngine()
             self.startTicking()
             self.startWatchdog()
         }
@@ -161,32 +271,37 @@ final class Recorder: NSObject, ObservableObject {
                 guard let self else { return }
                 Task { @MainActor in self.autoTick() }
             }
-            self.armMeteringRecorder()
+            self.armMeteringDetector()
         }
     }
 
     func disarmAutoRecord() {
         autoTimer?.invalidate(); autoTimer = nil
-        recorder?.stop(); recorder = nil
-        Self.cleanupProbe()
+        if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
+        if engine.isRunning { engine.stop() }
     }
 
     /// Единственный способ закончить запись — решение пользователя.
     func stop() {
         isRecording = false
         micBusy = false
+        partsCount = 0
 
         timer?.invalidate(); timer = nil
         watchdog?.invalidate(); watchdog = nil
         autoTimer?.invalidate(); autoTimer = nil
 
-        closePart()
-        stopKeepAlive()
+        if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
+        installedFormat = nil
+        if engine.isRunning { engine.stop() }
 
-        let finished = parts
-        parts = []
-        partsCount = 0
-        deliver(finished)
+        let frames = writer.framesWritten
+        writer.close()
+
+        let url = fileURL
+        let started = startedAt
+        fileURL = nil
+        startedAt = nil
 
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         endBgTask()
@@ -194,63 +309,27 @@ final class Recorder: NSObject, ObservableObject {
         elapsed = 0
         level = 0
         peak = 0
+
+        deliver(url: url, frames: frames, startedAt: started)
     }
 
-    // MARK: - Куски записи
+    // MARK: - Файл записи
 
-    /// Начинает новый кусок: всегда новый файл, никогда не старый.
-    private func openPart() {
-        closePart()
-        activateSession()
-
-        let url = Self.newFileURL()
-        let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: 44_100,
-            AVNumberOfChannelsKey: 1,
-            AVEncoderBitRateKey: 96_000,
-            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
-        ]
-        guard let r = try? AVAudioRecorder(url: url, settings: settings) else { return }
-        r.isMeteringEnabled = true
-        r.delegate = self
-        guard r.record() else { return }
-
-        recorder = r
-        parts.append((url: url, start: Date(), end: nil))
-        partsCount = parts.count
-        micBusy = false
+    /// Открывает один рабочий файл на всю запись. Больше он не переоткрывается.
+    private func openFile() {
+        guard let url = Self.newWorkingURL() else { return }
+        fileURL = url
+        writer.open(url: url)
     }
 
-    /// Закрывает текущий кусок, чтобы файл корректно дописался на диск.
-    private func closePart() {
-        if let rec = recorder {
-            rec.updateMeters()
-            rec.stop()
-        }
-        recorder = nil
-        if let index = parts.indices.last, parts[index].end == nil {
-            parts[index].end = Date()
-        }
-    }
-
-    /// Время, которое реально записано (без вычета пауз, когда микрофон был занят).
-    private func recordedTime(now: Date) -> TimeInterval {
-        var total: TimeInterval = 0
-        for part in parts {
-            total += (part.end ?? now).timeIntervalSince(part.start)
-        }
-        return total
-    }
-
-    // MARK: - Внутренняя часть
+    // MARK: - Движок записи
 
     /// Настраивает и включает звуковую сессию так, чтобы запись шла и в фоне.
     private func activateSession() {
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setCategory(.playAndRecord, mode: .default,
-                                    options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
+                                    options: [.defaultToSpeaker, .allowBluetooth])
             try session.setActive(true)
         } catch {
             try? session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
@@ -258,18 +337,53 @@ final class Recorder: NSObject, ObservableObject {
         }
     }
 
-    private func armMeteringRecorder() {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("probe.m4a")
-        let settings: [String: Any] = [
-            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
-            AVSampleRateKey: 44_100,
-            AVNumberOfChannelsKey: 1,
-            AVEncoderAudioQualityKey: AVAudioQuality.low.rawValue
-        ]
-        recorder = try? AVAudioRecorder(url: url, settings: settings)
-        recorder?.isMeteringEnabled = true
-        recorder?.record()
+    private func startEngine() {
+        guard isRecording else { return }
+        activateSession()
+        if inCall {
+            micBusy = true
+            return
+        }
+
+        let input = engine.inputNode
+        var fmt = input.inputFormat(forBus: 0)
+        if fmt.sampleRate == 0 || fmt.channelCount == 0 {
+            fmt = input.outputFormat(forBus: 0)
+        }
+        guard fmt.sampleRate > 0, fmt.channelCount > 0 else { return }
+
+        if !tapInstalled || installedFormat?.isEqual(fmt) != true {
+            if tapInstalled { input.removeTap(onBus: 0); tapInstalled = false }
+            writer.configure(inputFormat: fmt)
+            let writer = self.writer
+            input.installTap(onBus: 0, bufferSize: 4096, format: fmt) { buffer, _ in
+                writer.write(buffer)
+            }
+            tapInstalled = true
+            installedFormat = fmt
+        }
+
+        do {
+            if !engine.isRunning {
+                engine.prepare()
+                try engine.start()
+            }
+            micBusy = false
+        } catch {
+            micBusy = true
+        }
     }
+
+    /// Аккуратно останавливает движок, но НЕ закрывает файл: после звонка запись
+    /// продолжится в тот же самый файл.
+    private func suspendForInterruption() {
+        guard isRecording else { return }
+        micBusy = true
+        if engine.isRunning { engine.stop() }
+        startWatchdog()
+    }
+
+    // MARK: - Индикаторы и сторож
 
     private func startTicking() {
         timer?.invalidate()
@@ -281,24 +395,22 @@ final class Recorder: NSObject, ObservableObject {
 
     private func recordTick() {
         guard isRecording else { return }
-        elapsed = recordedTime(now: Date())
-        guard let rec = recorder, rec.isRecording else { return }
-        rec.updateMeters()
-        let lvl = Self.normalized(power: rec.averagePower(forChannel: 0))
+        elapsed = writer.recordedSeconds
+        let lvl = writer.currentLevel
         level = lvl
         peak = max(peak, lvl)
     }
 
     private func autoTick() {
-        guard let r = recorder else { return }
-        r.updateMeters()
-        let lvl = Self.normalized(power: r.averagePower(forChannel: 0))
+        // Пока идёт разговор, микрофон занят — просто ждём.
+        if inCall { return }
+        let lvl = writer.currentLevel
         if lvl >= autoLevelThreshold {
             if loudSince == nil { loudSince = Date() }
             if let s = loudSince, Date().timeIntervalSince(s) >= 1.2 {
                 autoTimer?.invalidate(); autoTimer = nil
-                Self.cleanupProbe()
-                try? AVAudioSession.sharedInstance().setActive(false)
+                if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
+                if engine.isRunning { engine.stop() }
                 start()
             }
         } else {
@@ -306,14 +418,30 @@ final class Recorder: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Возврат записи
-
-    private func markMicBusy() {
-        guard isRecording else { return }
-        micBusy = true
-        // Текущий кусок аккуратно закрываем: дальше пойдёт новый файл.
-        closePart()
-        startWatchdog()
+    /// Детектор громкости для автозаписи: отдельный движок, файл не пишется.
+    private func armMeteringDetector() {
+        let input = engine.inputNode
+        var fmt = input.inputFormat(forBus: 0)
+        if fmt.sampleRate == 0 || fmt.channelCount == 0 {
+            fmt = input.outputFormat(forBus: 0)
+        }
+        guard fmt.sampleRate > 0, fmt.channelCount > 0 else { return }
+        if !tapInstalled || installedFormat?.isEqual(fmt) != true {
+            if tapInstalled { input.removeTap(onBus: 0); tapInstalled = false }
+            let writer = self.writer
+            input.installTap(onBus: 0, bufferSize: 4096, format: fmt) { buffer, _ in
+                let lvl = AudioWriter.measureLevel(buffer)
+                writer.setLevel(lvl)
+            }
+            tapInstalled = true
+            installedFormat = fmt
+        }
+        do {
+            if !engine.isRunning {
+                engine.prepare()
+                try engine.start()
+            }
+        } catch { }
     }
 
     /// Сторож: пока запись включена, проверяет, что звук действительно пишется,
@@ -329,89 +457,69 @@ final class Recorder: NSObject, ObservableObject {
     private func watchdogTick() {
         guard isRecording else { watchdog?.invalidate(); watchdog = nil; return }
         if inCall { micBusy = true; return }
-        if let rec = recorder, rec.isRecording {
-            if micBusy { micBusy = false }
+        if !engine.isRunning {
+            startEngine()
             return
         }
-        openPart()
+        // Движок работает, но звук давно не приходил — значит, его надо поднять заново.
+        if let last = writer.lastWriteAt {
+            if Date().timeIntervalSince(last) > 2.5 { startEngine(); return }
+        } else if let started = startedAt, Date().timeIntervalSince(started) > 2.5 {
+            startEngine()
+        }
+        if micBusy { micBusy = false }
     }
 
     /// Немедленная попытка вернуть запись (после прерывания, смены маршрута).
     private func tryResumeNow() {
         guard isRecording else { return }
         if inCall { micBusy = true; startWatchdog(); return }
-        if let rec = recorder, rec.isRecording { micBusy = false; return }
-        openPart()
+        if engine.isRunning { engine.stop() }
+        startEngine()
     }
 
-    /// Имя нового файла записи. Если такой уже есть, добавляется уточнение.
-    nonisolated static func newFileURL() -> URL {
+    /// Имя рабочего файла записи. Если такой уже есть, добавляется уточнение.
+    nonisolated static func newWorkingURL() -> URL? {
         let stamp = fileStamp.string(from: Date())
-        var url = RecordingsStore.audioDirectory.appendingPathComponent("Запись " + stamp + ".m4a")
+        var url = RecordingsStore.audioDirectory.appendingPathComponent("Запись " + stamp + ".caf")
         var n = 2
         while FileManager.default.fileExists(atPath: url.path) {
-            url = RecordingsStore.audioDirectory.appendingPathComponent("Запись " + stamp + " (" + String(n) + ").m4a")
+            url = RecordingsStore.audioDirectory.appendingPathComponent("Запись " + stamp + " (" + String(n) + ").caf")
             n += 1
         }
         return url
     }
 
-    /// Выдаёт готовые записи в список. Куски склеиваются в один файл, чтобы
-    /// разговор остался одной записью.
-    private func deliver(_ finished: [(url: URL, start: Date, end: Date?)]) {
-        guard let first = finished.first else { return }
+    // MARK: - Выдача готовой записи
 
-        if finished.count == 1 {
-            let duration = (first.end ?? Date()).timeIntervalSince(first.start)
-            if duration >= 1, let rec = Recording(url: first.url, createdAt: first.start, duration: duration) {
-                onFinish?(rec)
-            } else {
-                try? FileManager.default.removeItem(at: first.url)
-            }
+    /// Превращает рабочий файл в готовую запись m4a и отдаёт её в список.
+    private func deliver(url: URL?, frames: AVAudioFramePosition, startedAt: Date?) {
+        guard let url, frames > 0 else {
+            if let url { try? FileManager.default.removeItem(at: url) }
             return
         }
-
-        let total = recordedTime(now: Date())
-        let urls = finished.map { $0.url }
+        let duration = Double(frames) / writer.format.sampleRate
+        let created = startedAt ?? Date()
         Task { @MainActor in
-            if let merged = await Self.merge(parts: urls),
-               let rec = Recording(url: merged, createdAt: first.start, duration: total) {
-                for url in urls where url != merged {
-                    try? FileManager.default.removeItem(at: url)
-                }
+            if let m4a = await Self.convertToM4A(source: url),
+               let rec = Recording(url: m4a, createdAt: created, duration: duration) {
+                self.onFinish?(rec)
+            } else if let rec = Recording(url: url, createdAt: created, duration: duration) {
                 self.onFinish?(rec)
             } else {
-                for part in finished {
-                    let duration = (part.end ?? Date()).timeIntervalSince(part.start)
-                    if duration >= 1, let rec = Recording(url: part.url, createdAt: part.start, duration: duration) {
-                        self.onFinish?(rec)
-                    } else {
-                        try? FileManager.default.removeItem(at: part.url)
-                    }
-                }
+                try? FileManager.default.removeItem(at: url)
             }
         }
     }
 
-    /// Склеивает куски в один m4a. Итоговый файл получает имя первого куска.
-    nonisolated static func merge(parts: [URL]) async -> URL? {
-        guard parts.count > 1 else { return parts.first }
-        let composition = AVMutableComposition()
-        guard let track = composition.addMutableTrack(withMediaType: .audio,
-                                                      preferredTrackID: kCMPersistentTrackID_Invalid) else { return nil }
-        var cursor = CMTime.zero
-        for url in parts {
-            let asset = AVURLAsset(url: url)
-            guard let duration = try? await asset.load(.duration),
-                  let source = try? await asset.loadTracks(withMediaType: .audio).first else { return nil }
-            let range = CMTimeRange(start: .zero, duration: duration)
-            guard (try? track.insertTimeRange(range, of: source, at: cursor)) != nil else { return nil }
-            cursor = CMTimeAdd(cursor, duration)
-        }
-        guard let exporter = AVAssetExportSession(asset: composition,
+    /// Переводит рабочий файл в m4a. Если не получилось — вернём nil и останется
+    /// рабочий файл (он тоже проигрывается).
+    nonisolated static func convertToM4A(source: URL) async -> URL? {
+        let asset = AVURLAsset(url: source)
+        guard let exporter = AVAssetExportSession(asset: asset,
                                                   presetName: AVAssetExportPresetAppleM4A) else { return nil }
         let tmp = FileManager.default.temporaryDirectory
-            .appendingPathComponent("merge-" + UUID().uuidString + ".m4a")
+            .appendingPathComponent("export-" + UUID().uuidString + ".m4a")
         exporter.outputURL = tmp
         exporter.outputFileType = .m4a
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
@@ -421,65 +529,15 @@ final class Recorder: NSObject, ObservableObject {
             try? FileManager.default.removeItem(at: tmp)
             return nil
         }
-        let target = parts[0]
+        let target = RecordingsStore.audioDirectory
+            .appendingPathComponent(source.deletingPathExtension().lastPathComponent + ".m4a")
         try? FileManager.default.removeItem(at: target)
-        do { try FileManager.default.moveItem(at: tmp, to: target) } catch { return nil }
+        guard (try? FileManager.default.moveItem(at: tmp, to: target)) != nil else { return nil }
+        try? FileManager.default.removeItem(at: source)
         return target
     }
 
     // MARK: - Удержание приложения в фоне
-
-    /// Тихая «подложка» на время записи. Без неё система может усыпить
-    /// приложение, пока микрофон занят звонком, и запись не вернётся сама.
-    private func startKeepAlive() {
-        guard keepAlive == nil else { return }
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("silence.wav")
-        if !FileManager.default.fileExists(atPath: url.path) {
-            Self.writeSilentWav(to: url)
-        }
-        guard let player = try? AVAudioPlayer(contentsOf: url) else { return }
-        player.numberOfLoops = -1
-        player.volume = 0
-        player.prepareToPlay()
-        player.play()
-        keepAlive = player
-    }
-
-    private func stopKeepAlive() {
-        keepAlive?.stop()
-        keepAlive = nil
-    }
-
-    /// Создаёт короткий файл тишины.
-    nonisolated static func writeSilentWav(to url: URL) {
-        let sampleRate: UInt32 = 8000
-        let seconds: UInt32 = 1
-        let dataBytes = sampleRate * seconds * 2
-        var data = Data()
-        func append(_ value: UInt32) {
-            var v = value.littleEndian
-            withUnsafeBytes(of: &v) { data.append(contentsOf: $0) }
-        }
-        func append16(_ value: UInt16) {
-            var v = value.littleEndian
-            withUnsafeBytes(of: &v) { data.append(contentsOf: $0) }
-        }
-        data.append(contentsOf: Array("RIFF".utf8))
-        append(36 + dataBytes)
-        data.append(contentsOf: Array("WAVE".utf8))
-        data.append(contentsOf: Array("fmt ".utf8))
-        append(16)
-        append16(1)
-        append16(1)
-        append(sampleRate)
-        append(sampleRate * 2)
-        append16(2)
-        append16(16)
-        data.append(contentsOf: Array("data".utf8))
-        append(dataBytes)
-        data.append(Data(count: Int(dataBytes)))
-        try? data.write(to: url)
-    }
 
     private func beginBgTask() {
         guard bgTask == .invalid else { return }
@@ -494,17 +552,6 @@ final class Recorder: NSObject, ObservableObject {
         bgTask = .invalid
     }
 
-    nonisolated static func cleanupProbe() {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("probe.m4a")
-        try? FileManager.default.removeItem(at: url)
-    }
-
-    /// averagePower: -160...0 дБ -> 0...1
-    nonisolated static func normalized(power: Float) -> Float {
-        let db = max(power, -60)
-        return (db + 60) / 60
-    }
-
     nonisolated static let fileStamp: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd HH-mm-ss"
@@ -513,7 +560,26 @@ final class Recorder: NSObject, ObservableObject {
     }()
 }
 
-// MARK: - Реакция на звонок и на неожиданную остановку записи
+extension AudioWriter {
+    /// Громкость буфера 0...1 (для автозаписи).
+    static func measureLevel(_ buffer: AVAudioPCMBuffer) -> Float {
+        guard let channels = buffer.floatChannelData, buffer.frameLength > 0 else { return 0 }
+        let n = Int(buffer.frameLength)
+        var sum: Float = 0
+        for i in 0..<n {
+            let v = channels[0][i]
+            sum += v * v
+        }
+        return min(1, (sum / Float(n)).squareRoot() * 6)
+    }
+
+    func setLevel(_ value: Float) {
+        lock.lock(); defer { lock.unlock() }
+        level = value
+    }
+}
+
+// MARK: - Реакция на звонок
 
 extension Recorder: CXCallObserverDelegate {
     nonisolated func callObserver(_ callObserver: CXCallObserver, callChanged call: CXCall) {
@@ -521,20 +587,10 @@ extension Recorder: CXCallObserverDelegate {
         Task { @MainActor in
             guard self.isRecording else { return }
             if busy {
-                self.markMicBusy()
+                self.suspendForInterruption()
             } else {
                 self.tryResumeNow()
             }
-        }
-    }
-}
-
-extension Recorder: AVAudioRecorderDelegate {
-    nonisolated func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
-        Task { @MainActor in
-            guard self.isRecording else { return }
-            // Кусок закончился сам — продолжаем новым файлом.
-            self.tryResumeNow()
         }
     }
 }
