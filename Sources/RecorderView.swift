@@ -28,10 +28,19 @@ struct RecorderView: View {
                     .padding(.horizontal)
 
                 if recorder.isRecording {
-                    Label("Запись идёт постоянно — и в фоне, и во время звонка. Останавливает только кнопка «Стоп».",
+                    Label("Запись идёт постоянно: в фоне, при заблокированном экране и до и после звонка. Останавливает только кнопка «Стоп».",
                           systemImage: "arrow.down.circle")
                         .font(.caption)
                         .foregroundStyle(.green)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+                }
+
+                if recorder.partsCount > 1 {
+                    Label("Разговор собирается из \(recorder.partsCount) частей — при остановке они склеятся в одну запись.",
+                          systemImage: "square.stack.3d.up")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal)
                 }
@@ -62,13 +71,13 @@ struct RecorderView: View {
     }
 
     private var statusTitle: String {
-        if recorder.micBusy { return "Запись идёт — микрофон занят звонком" }
+        if recorder.micBusy { return "Идёт разговор — микрофон занят" }
         return recorder.isRecording ? "Идёт запись" : "Готово к записи"
     }
 
     private var statusHint: String {
         if recorder.micBusy {
-            return "Сейчас микрофон занят телефонным разговором. Запись никуда не делась и включится сама, как только звонок освободит микрофон. Остановит её только кнопка «Стоп»."
+            return "Идёт телефонный разговор — сейчас микрофон принадлежит ему. Это ограничение iPhone. Запись включится сама сразу после звонка, останавливать её не нужно."
         }
         if recorder.isRecording {
             return "Говорите. Для записи обоих голосов включите громкую связь. Приложение можно свернуть — запись не остановится."

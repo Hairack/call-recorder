@@ -70,7 +70,7 @@ struct SettingsView: View {
 
                 Section("О приложении") {
                     LabeledContent("Название", value: "Диктофон разговоров")
-                    LabeledContent("Версия", value: "1.2")
+                    LabeledContent("Версия", value: "1.3")
                     LabeledContent("Язык", value: "Русский")
                 }
             }
