@@ -1,13 +1,15 @@
 import Foundation
 import AVFoundation
 import Combine
+import UIKit
+import CallKit
 
-/// Запись разговора через микрофон.
-/// Рассчитана на разговор по громкой связи: микрофон слышит оба голоса.
+/// Запись через микрофон. Рассчитана на разговор по громкой связи.
 ///
-/// Запись продолжается, когда приложение свёрнуто или экран заблокирован:
-/// в Info.plist включён фоновый режим «audio», а звуковая сессия остаётся
-/// активной всё время, пока идёт запись.
+/// Запись НИКОГДА не останавливается сама: пока пользователь не нажал «Стоп»,
+/// она остаётся включённой. Если систему прерывает звонок или будильник,
+/// приложение не выключает запись, а ждёт и возобновляет её сразу, как только
+/// микрофон снова доступен, продолжая тот же файл.
 @MainActor
 final class Recorder: NSObject, ObservableObject {
 
@@ -16,47 +18,79 @@ final class Recorder: NSObject, ObservableObject {
     @Published private(set) var level: Float = 0          // 0...1, для индикатора
     @Published private(set) var peak: Float = 0
 
-    /// Система забрала микрофон (начался звонок или сработал будильник).
-    /// Запись продолжится, когда микрофон освободится, если включено
-    /// «Продолжать после звонка».
-    @Published private(set) var interrupted = false
+    /// Микрофон на время занят системой (звонок, будильник). Запись при этом
+    /// НЕ выключается: файл остаётся открытым, и приложение само вернёт запись,
+    /// как только микрофон освободится. Останавливает запись только пользователь.
+    @Published private(set) var micBusy = false
 
     /// Автозапись: старт, когда звук дольше порога держится громким.
     @Published var autoRecord = false
     @Published var autoLevelThreshold: Float = 0.25
 
-    /// Продолжать писать после звонка, когда микрофон снова доступен.
+    /// Настройка из раздела «Настройки»: продолжать запись после звонка.
+    /// Сейчас запись всегда продолжается, поэтому значение только хранится.
     @Published var resumeAfterInterruption = true
 
     private var recorder: AVAudioRecorder?
     private var timer: Timer?
     private var autoTimer: Timer?
-    private var currentURL: URL?
-    private var startedAt: Date?
+    /// Сторож: пока запись включена, постоянно проверяет, что звук пишется,
+    /// и возвращает его при первой возможности.
+    private var watchdog: Timer?
+    /// Файлы одной записи. Обычно он один. Если звуковая подсистема телефона
+    /// перезапустится, приложение продолжит писать в НОВЫЙ файл, а не сотрёт уже
+    /// записанное: части идут подряд в списке записей.
+    private var parts: [(url: URL, startedAt: Date)] = []
+    private var currentURL: URL? { parts.last?.url }
+    private var startedAt: Date? { parts.first?.startedAt }
     private var loudSince: Date?
     private var observers: [NSObjectProtocol] = []
-    private var resumeAttempts = 0
+    private var bgTask: UIBackgroundTaskIdentifier = .invalid
+    /// Системный наблюдатель за звонками: пока идёт разговор, микрофон занят,
+    /// и пытаться что-то записать бессмысленно — ждём конца звонка.
+    private let callObserver = CXCallObserver()
 
     var onFinish: ((Recording) -> Void)?
 
     override init() {
         super.init()
-        // Следим за тем, когда система забирает и возвращает микрофон.
         let center = NotificationCenter.default
+
+        // Система забрала или вернула микрофон.
         observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification,
                                             object: nil, queue: .main) { [weak self] note in
-            guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
-            let began = (type == .began)
-            Task { @MainActor in self?.handleInterruption(began: began) }
+            let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            let type = raw.flatMap { AVAudioSession.InterruptionType(rawValue: $0) }
+            // Этот флаг означает «сессия уснула сама», а не настоящий звонок:
+            // тогда достаточно просто включить её обратно.
+            let wasSuspended = (note.userInfo?["AVAudioSessionInterruptionWasSuspendedKey"] as? Bool) ?? false
+            Task { @MainActor in
+                guard let self else { return }
+                if type == .began, !wasSuspended {
+                    self.markMicBusy()
+                } else {
+                    self.tryResumeNow()
+                }
+            }
         })
-        // Смена маршрута (вынули наушники, подключили гарнитуру) тоже может
-        // остановить запись — возвращаем её.
+
+        // Смена маршрута (наушники, гарнитура) тоже может остановить запись.
         observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification,
                                             object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.resumeIfNeeded() }
+            Task { @MainActor in self?.tryResumeNow() }
         })
+
+        // Звуковая подсистема перезапустилась — запись надо поднять заново.
+        observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification,
+                                            object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.rebuildAfterReset() }
+        })
+
+        callObserver.setDelegate(self, queue: .main)
     }
+
+    /// Идёт ли прямо сейчас телефонный разговор.
+    private var inCall: Bool { callObserver.calls.contains { !$0.hasEnded } }
 
     deinit {
         let center = NotificationCenter.default
@@ -93,12 +127,11 @@ final class Recorder: NSObject, ObservableObject {
         }
     }
 
-    /// Вызывается, когда приложение снова на экране: поправляет таймер, если
-    /// запись всё это время шла в фоне.
+    /// Вызывается, когда приложение снова на экране.
     func appBecameActive() {
         guard isRecording else { return }
         startTicking()
-        resumeIfNeeded()
+        tryResumeNow()
     }
 
     /// Включает режим ожидания громкого звука (для автостарта).
@@ -124,29 +157,29 @@ final class Recorder: NSObject, ObservableObject {
         Self.cleanupProbe()
     }
 
+    /// Единственный способ закончить запись — решение пользователя.
     func stop() {
-        timer?.invalidate(); timer = nil
-        autoTimer?.invalidate(); autoTimer = nil
-        recorder?.stop()
-        let url = currentURL
-        recorder = nil
+        // Сначала закрываем файл: так весь звук, включая последние секунды,
+        // гарантированно дописывается на диск.
         isRecording = false
-        interrupted = false
-        resumeAttempts = 0
-
-        if let url, let startedAt {
-            let duration = Date().timeIntervalSince(startedAt)
-            if duration >= 1, let rec = Recording(url: url, createdAt: startedAt, duration: duration) {
-                onFinish?(rec)
-            } else {
-                try? FileManager.default.removeItem(at: url)
-            }
+        micBusy = false
+        timer?.invalidate(); timer = nil
+        watchdog?.invalidate(); watchdog = nil
+        autoTimer?.invalidate(); autoTimer = nil
+        if let rec = recorder {
+            rec.updateMeters()
+            rec.stop()
         }
+        recorder = nil
+
+        let end = Date()
+        let finished = parts
+        parts = []
+        deliver(finished, end: end)
 
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        endBgTask()
 
-        currentURL = nil
-        startedAt = nil
         elapsed = 0
         level = 0
         peak = 0
@@ -158,13 +191,10 @@ final class Recorder: NSObject, ObservableObject {
     private func activateSession() {
         let session = AVAudioSession.sharedInstance()
         do {
-            // .mixWithOthers не даёт другим приложениям (музыка, видео) прерывать
-            // нашу запись — система прерывает только на звонок или будильник.
             try session.setCategory(.playAndRecord, mode: .default,
                                     options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers])
             try session.setActive(true)
         } catch {
-            // Не получилось с расширенным набором — пробуем самый простой.
             try? session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
             try? session.setActive(true)
         }
@@ -185,9 +215,9 @@ final class Recorder: NSObject, ObservableObject {
 
     private func beginSessionAndRecord() {
         activateSession()
+        beginBgTask()
 
-        let name = "Запись " + Self.fileStamp.string(from: Date()) + ".m4a"
-        let url = RecordingsStore.audioDirectory.appendingPathComponent(name)
+        let url = Self.newFileURL()
         let settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
             AVSampleRateKey: 44_100,
@@ -200,14 +230,13 @@ final class Recorder: NSObject, ObservableObject {
         r.record()
 
         recorder = r
-        currentURL = url
-        startedAt = Date()
+        parts = [(url, Date())]
         isRecording = true
-        interrupted = false
-        resumeAttempts = 0
+        micBusy = false
         elapsed = 0
         peak = 0
         startTicking()
+        startWatchdog()
     }
 
     private func startTicking() {
@@ -219,7 +248,7 @@ final class Recorder: NSObject, ObservableObject {
     }
 
     private func recordTick() {
-        // Время считаем от начала записи, а не по числу «тиков»: в фоне таймер
+        // Время считаем по часам, а не по числу «тиков»: в фоне таймер
         // останавливается, но запись идёт — время должно быть верным.
         if let s = startedAt { elapsed = Date().timeIntervalSince(s) }
         guard let rec = recorder else { return }
@@ -246,38 +275,185 @@ final class Recorder: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Прерывания (звонок, будильник, смена маршрута)
+    // MARK: - Возврат записи
 
-    private func handleInterruption(began: Bool) {
-        if began {
-            // Микрофон забрала система (обычно — входящий или исходящий звонок).
-            if isRecording { interrupted = true }
-            timer?.invalidate(); timer = nil
-        } else {
-            resumeIfNeeded()
+    private func markMicBusy() {
+        guard isRecording else { return }
+        micBusy = true
+        // Сессию НЕ выключаем: так система вернёт звук быстрее.
+        startWatchdog()
+    }
+
+    /// Сторож: пока запись включена, проверяет, что звук действительно пишется,
+    /// и возвращает запись при первой возможности. Пока идёт телефонный разговор,
+    /// ничего не трогаем — ждём, когда звонок отпустит микрофон.
+    private func startWatchdog() {
+        watchdog?.invalidate()
+        watchdog = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in self.watchdogTick() }
         }
     }
 
-    /// Пытается вернуть запись после паузы. Держит тот же файл, поэтому разговор
-    /// остаётся одной записью.
-    private func resumeIfNeeded() {
-        guard isRecording, !interrupted || resumeAfterInterruption else { return }
-        guard resumeAttempts < 6 else { return }
+    private func watchdogTick() {
+        guard isRecording else { watchdog?.invalidate(); watchdog = nil; return }
+        if inCall { micBusy = true; return }
+        guard let rec = recorder else { return }
+        if rec.isRecording {
+            if micBusy { micBusy = false }
+            return
+        }
+        activateSession()
+        if rec.record() {
+            micBusy = false
+            startTicking()
+        }
+    }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
-            guard let self, self.isRecording else { return }
-            guard let rec = self.recorder else { return }
+    /// Немедленная попытка вернуть запись (после прерывания, смены маршрута).
+    private func tryResumeNow() {
+        guard isRecording else { return }
+        if inCall { micBusy = true; startWatchdog(); return }
+        guard let rec = recorder else { return }
+        activateSession()
+        if rec.record() {
+            micBusy = false
+            startTicking()
+        } else {
+            startWatchdog()
+        }
+    }
 
-            self.activateSession()
-            if rec.record() {
-                self.interrupted = false
-                self.resumeAttempts = 0
-                self.startTicking()
+    /// Звуковая подсистема перезапустилась: поднимаем запись с нуля, но в тот же
+    /// файл, чтобы разговор остался одной записью.
+    private func rebuildAfterReset() {
+        guard isRecording else { return }
+        // Закрываем текущий файл и продолжаем в новый, чтобы не потерять уже
+        // записанный звук.
+        recorder?.stop()
+        recorder = nil
+        activateSession()
+        let url = Self.newFileURL()
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: 44_100,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderBitRateKey: 96_000,
+            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+        ]
+        guard let r = try? AVAudioRecorder(url: url, settings: settings) else { return }
+        r.isMeteringEnabled = true
+        r.record()
+        recorder = r
+        parts.append((url, Date()))
+        micBusy = false
+        startTicking()
+        startWatchdog()
+    }
+
+    /// Имя нового файла записи. Если файл с таким именем уже есть (например,
+    /// части пишутся в одну и ту же секунду), добавляется уточнение.
+    nonisolated static func newFileURL() -> URL {
+        let stamp = fileStamp.string(from: Date())
+        var url = RecordingsStore.audioDirectory.appendingPathComponent("Запись " + stamp + ".m4a")
+        var n = 2
+        while FileManager.default.fileExists(atPath: url.path) {
+            url = RecordingsStore.audioDirectory.appendingPathComponent("Запись " + stamp + " (" + String(n) + ").m4a")
+            n += 1
+        }
+        return url
+    }
+
+    /// Выдаёт готовые записи в список. Если звук писался кусками (например,
+    /// из-за перезапуска звуковой подсистемы), куски склеиваются в один файл,
+    /// чтобы разговор остался одной записью.
+    private func deliver(_ finished: [(url: URL, startedAt: Date)], end: Date) {
+        guard let first = finished.first else { return }
+
+        if finished.count == 1 {
+            let duration = end.timeIntervalSince(first.startedAt)
+            if duration >= 1, let rec = Recording(url: first.url, createdAt: first.startedAt, duration: duration) {
+                onFinish?(rec)
             } else {
-                self.resumeAttempts += 1
-                self.resumeIfNeeded()
+                try? FileManager.default.removeItem(at: first.url)
+            }
+            return
+        }
+
+        let total = end.timeIntervalSince(first.startedAt)
+        let urls = finished.map { $0.url }
+        Task { @MainActor in
+            if let merged = await Self.merge(parts: urls),
+               let rec = Recording(url: merged, createdAt: first.startedAt, duration: total) {
+                for url in urls where url != merged {
+                    try? FileManager.default.removeItem(at: url)
+                }
+                self.onFinish?(rec)
+            } else {
+                // Склеить не вышло — показываем куски отдельными записями.
+                var index = 0
+                while index < finished.count {
+                    let part = finished[index]
+                    let partEnd = index + 1 < finished.count ? finished[index + 1].startedAt : end
+                    let duration = partEnd.timeIntervalSince(part.startedAt)
+                    if duration >= 1, let rec = Recording(url: part.url, createdAt: part.startedAt, duration: duration) {
+                        self.onFinish?(rec)
+                    } else {
+                        try? FileManager.default.removeItem(at: part.url)
+                    }
+                    index += 1
+                }
             }
         }
+    }
+
+    /// Склеивает части записи в один m4a. Итоговый файл получает имя первой части.
+    nonisolated static func merge(parts: [URL]) async -> URL? {
+        guard parts.count > 1 else { return parts.first }
+        let composition = AVMutableComposition()
+        guard let track = composition.addMutableTrack(withMediaType: .audio,
+                                                      preferredTrackID: kCMPersistentTrackID_Invalid) else { return nil }
+        var cursor = CMTime.zero
+        for url in parts {
+            let asset = AVURLAsset(url: url)
+            guard let duration = try? await asset.load(.duration),
+                  let source = try? await asset.loadTracks(withMediaType: .audio).first else { return nil }
+            let range = CMTimeRange(start: .zero, duration: duration)
+            guard (try? track.insertTimeRange(range, of: source, at: cursor)) != nil else { return nil }
+            cursor = CMTimeAdd(cursor, duration)
+        }
+        guard let exporter = AVAssetExportSession(asset: composition,
+                                                  presetName: AVAssetExportPresetAppleM4A) else { return nil }
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("merge-" + UUID().uuidString + ".m4a")
+        exporter.outputURL = tmp
+        exporter.outputFileType = .m4a
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            exporter.exportAsynchronously { cont.resume() }
+        }
+        guard exporter.status == .completed else {
+            try? FileManager.default.removeItem(at: tmp)
+            return nil
+        }
+        let target = parts[0]
+        try? FileManager.default.removeItem(at: target)
+        do { try FileManager.default.moveItem(at: tmp, to: target) } catch { return nil }
+        return target
+    }
+
+    // MARK: - Удержание приложения в фоне
+
+    private func beginBgTask() {
+        guard bgTask == .invalid else { return }
+        bgTask = UIApplication.shared.beginBackgroundTask(withName: "CallRecorder") { [weak self] in
+            Task { @MainActor in self?.endBgTask() }
+        }
+    }
+
+    private func endBgTask() {
+        guard bgTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(bgTask)
+        bgTask = .invalid
     }
 
     nonisolated static func cleanupProbe() {
@@ -297,4 +473,20 @@ final class Recorder: NSObject, ObservableObject {
         f.locale = Locale(identifier: "ru_RU")
         return f
     }()
+}
+
+// MARK: - Реакция на начало и конец звонка
+
+extension Recorder: CXCallObserverDelegate {
+    nonisolated func callObserver(_ callObserver: CXCallObserver, callChanged call: CXCall) {
+        let busy = callObserver.calls.contains { !$0.hasEnded }
+        Task { @MainActor in
+            guard self.isRecording else { return }
+            if busy {
+                self.markMicBusy()
+            } else {
+                self.tryResumeNow()
+            }
+        }
+    }
 }

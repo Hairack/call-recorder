@@ -28,7 +28,7 @@ struct RecorderView: View {
                     .padding(.horizontal)
 
                 if recorder.isRecording {
-                    Label("Запись идёт и в фоне — можно свернуть приложение и позвонить",
+                    Label("Запись идёт постоянно — и в фоне, и во время звонка. Останавливает только кнопка «Стоп».",
                           systemImage: "arrow.down.circle")
                         .font(.caption)
                         .foregroundStyle(.green)
@@ -62,18 +62,18 @@ struct RecorderView: View {
     }
 
     private var statusTitle: String {
-        if recorder.interrupted { return "Запись на паузе (идёт звонок)" }
+        if recorder.micBusy { return "Запись идёт — микрофон занят звонком" }
         return recorder.isRecording ? "Идёт запись" : "Готово к записи"
     }
 
     private var statusHint: String {
-        if recorder.interrupted {
-            return "Система забрала микрофон. Запись вернётся автоматически, когда звонок освободит его."
+        if recorder.micBusy {
+            return "Сейчас микрофон занят телефонным разговором. Запись никуда не делась и включится сама, как только звонок освободит микрофон. Остановит её только кнопка «Стоп»."
         }
         if recorder.isRecording {
             return "Говорите. Для записи обоих голосов включите громкую связь. Приложение можно свернуть — запись не остановится."
         }
-        return "Нажмите «Начать запись», сверните приложение и позвоните по громкой связи. Запись пойдёт в фоне."
+        return "Нажмите «Начать запись» — и всё, что происходит вокруг, будет записано. Приложение можно свернуть, экран заблокировать, позвонить. Запись остановится только по кнопке «Стоп»."
     }
 
     private var timer: some View {
