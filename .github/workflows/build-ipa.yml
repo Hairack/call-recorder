@@ -7,13 +7,14 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - name: Получить код
         uses: actions/checkout@v4
 
-      - name: Показать версии
+      - name: Выбрать Xcode и показать версии
         run: |
+          sudo xcode-select -s /Applications/Xcode.app
           xcodebuild -version
           swift --version
 
@@ -37,14 +38,14 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_ENTITLEMENTS="" \
-            build | tail -n 40
+            build | tail -n 50
 
       - name: Найти приложение
         id: find
         run: |
           APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -n1)
           if [ -z "$APP" ]; then echo "Приложение не собралось"; exit 1; fi
-          echo "app=$APP" >> $GITHUB_OUTPUT
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
           echo "Найдено: $APP"
 
       - name: Упаковать в IPA
