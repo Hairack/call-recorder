@@ -166,6 +166,12 @@ final class Recorder: NSObject, ObservableObject {
     private var fileURL: URL?
     private var startedAt: Date?
 
+    /// Тихий проигрыватель внутри движка. Пока он «играет», звуковая сессия
+    /// остаётся активной и в фоне — поэтому запись не засыпает, когда приложение
+    /// свёрнуто или экран заблокирован.
+    private let silence = AVAudioPlayerNode()
+    private var silenceReady = false
+
     var onFinish: ((Recording) -> Void)?
 
     override init() {
@@ -278,6 +284,7 @@ final class Recorder: NSObject, ObservableObject {
     func disarmAutoRecord() {
         autoTimer?.invalidate(); autoTimer = nil
         if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
+        silence.stop()
         if engine.isRunning { engine.stop() }
     }
 
@@ -293,6 +300,7 @@ final class Recorder: NSObject, ObservableObject {
 
         if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
         installedFormat = nil
+        silence.stop()
         if engine.isRunning { engine.stop() }
 
         let frames = writer.framesWritten
@@ -368,9 +376,39 @@ final class Recorder: NSObject, ObservableObject {
                 engine.prepare()
                 try engine.start()
             }
+            silenceReady = true
+            startSilentLoop()
             micBusy = false
         } catch {
             micBusy = true
+        }
+    }
+
+    /// Запускает неслышимый поток звука внутри движка. Без него iOS может
+    /// приостановить запись, когда приложение уходит в фон.
+    private func startSilentLoop() {
+        let mixer = engine.mainMixerNode
+        if !silenceReady || silence.engine == nil {
+            engine.attach(silence)
+            engine.connect(silence, to: mixer, format: nil)
+        }
+        mixer.outputVolume = 0
+        var fmt = silence.outputFormat(forBus: 0)
+        if fmt.sampleRate == 0 || fmt.channelCount == 0 {
+            fmt = mixer.outputFormat(forBus: 0)
+        }
+        guard fmt.sampleRate > 0, fmt.channelCount > 0 else { return }
+        if !silence.isPlaying {
+            let frames = AVAudioFrameCount(fmt.sampleRate)
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frames) else { return }
+            buffer.frameLength = frames
+            if let ch = buffer.floatChannelData {
+                for c in 0..<Int(fmt.channelCount) {
+                    memset(ch[c], 0, Int(frames) * MemoryLayout<Float>.size)
+                }
+            }
+            silence.scheduleBuffer(buffer, at: nil, options: .loops, completionHandler: nil)
+            silence.play()
         }
     }
 

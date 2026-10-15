@@ -11,7 +11,7 @@ settings:
   base:
     SWIFT_VERSION: "5.9"
     TARGETED_DEVICE_FAMILY: "1"
-    MARKETING_VERSION: "1.4"
+    MARKETING_VERSION: "1.5"
     CURRENT_PROJECT_VERSION: "1"
     CODE_SIGN_STYLE: Automatic
 
@@ -33,8 +33,8 @@ targets:
       properties:
         CFBundleDisplayName: "Диктофон разговоров"
         CFBundleName: "CallRecorder"
-        CFBundleShortVersionString: "1.4"
-        CFBundleVersion: "5"
+        CFBundleShortVersionString: "1.5"
+        CFBundleVersion: "6"
         NSMicrophoneUsageDescription: "Микрофон нужен, чтобы записывать разговоры по громкой связи."
         UIUserInterfaceStyle: Dark
         UILaunchScreen: {}
