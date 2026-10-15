@@ -55,7 +55,7 @@ final class RecordingsStore: ObservableObject {
         return items.filter {
             $0.title.lowercased().contains(q)
                 || ($0.transcript ?? "").lowercased().contains(q)
-                || Recording.stamp.string(from: $0.createdAt).contains(q)
+                || RecordingsStore.stamp.string(from: $0.createdAt).contains(q)
         }
     }
 
